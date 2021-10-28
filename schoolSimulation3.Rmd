@@ -1,0 +1,632 @@
+---
+title: "schoolSimulations3"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Model
+
+This is a discrete time state space model for one group with a homogeneous group of individuals.
+
+### States
+
+Three systems exist in parallel partitioning the population in different ways.
+
+#### Clinical states (observable but subjective)
+- Asymptomatic (for Covid, though symptoms for other diseases might be presents)
+- Symptomatic for Covid
+- Ambiguous symptoms
+
+Clinical state could be reason for self-isolation or incentive to get a test (symptomatic test). A decision tree could model the behaviour depending on what type of symptomatic state.
+
+#### Infectiousness states (latent)
+- Susc: Susceptible
+- Ipre: Pre-infectious 
+- Iinf: Infectious 
+- Ipost: Post-infectious
+
+Individuals start with susceptible and pass through the above states in a linear order, while reinfection due to waning immunity can make this a loop. Using only these basic states, the model is not Markovian, because transitions probability from pre-infectious to infectious depends on the time spent in the pre-infectious state. The same is true for the transition from infectious to recovered and from recovered to susceptible. 
+Therefore split Ipre and Iinf into compartments by days since infection. 
+Length of these states assumed deterministic for now (Ipre is 4 days, Iinf is 9 days) 
+(Note: add stochastic length to the model later, keep data structure flexible in view of that)
+
+#### Isolation states (dependent on other variables)
+Through testing and lockdown interventions (including circuit breakers), we add additional states that mirror the infection states, just keep the person in isolation and hence out of the infection dynamics. 
+
+- QSusc: susceptible subject in isolation 
+- QIpre: pre-infectious person in isolation
+- QIinf: infectious person in isolation
+- QPost: recovered person in isolation
+
+Note: check if returning to original state works correctly
+
+#### Test states (observable according to testing schemes, but subject to errors)
+- not tested
+- pos/neg LFT
+- pos/neg PCR
+
+#### Assumptions, comments, questions
+- In the current approach we store numbers in states not individual trajectories. So, the trajectory information is not fully followed, which is a simplification. 
+- Test are subject to technical errors at various stages (probe extraction, labeling, reading, transport, lab). That means 
+- Self isolation after fixed time or release by test, but where is person than returned to?
+- Infectiousness constant over time within Ipre and Iinf (later: make dependend on time after infection).
+- Infectiousness homogeneous (later: mixed population, simplest case superspreaders such as teachers).
+- Length of infectious states current constant, but can be made random later.
+
+### Infection dynamics
+Generate temporal evolution of counts of infected students in all states as follows:
+
+- Day 0: All individuals are susceptible and no school takes place on Day 0.
+- Day t: Test in the morning and update infection run via community and in school Report state at end of that day.
+
+Does individual with pos rapid test go home right away excluding them to avoid infecting others?
+Updates are recorded on that day and suitable future days
+
+#### External infection rates
+
+The external infection rates below refer to the probability for one student to get infected on one day from a specified source.
+
+- pwork: infection via community on work days, e.g. friends, clubs
+- pfree: infection via community on free days (maybe higher than pwork)
+- pcom: infection via commuting (e.g. bus)
+ 
+#### Internal infections rates
+
+The internal infection rates below refer to the probability for one student to get infected on one day arising from each infected other student. They have to be multiplied with the number of infected students. This is a simplification when there are multiple (or even larger numbers) infected other students, as this probability will saturate; it has to be capped at 1. 
+
+- pinf: infection inside group baseline probablity (per day, per infected infectious person,...)
+- pcom: susceptable students get infected (at home, commute, schoolyard contact with other groups etc) 
+- ppre: incremental infections probability (risk) created per student in Ipre (should be 0) 
+- pinf: infections risk probability (risk) created student in Iinf
+
+Simplification (for now) all days are school days (consider weekends later).
+Consider also "no school" as an alternative scenario.
+
+### Disease detection 
+
+#### By symptoms 
+
+The relationship between symptoms and infectiousness is a bit unclear and highly individual, so the following is just a rough framework. In reality, people can be infectious before showing symptoms, in particular if they are asymptomatic all together. It will be age dependent and the latter case is more likely in school students than in older parts of he population. But is may also be the case that they are not infectious until symptoms start. Symptomatic detection probabilities refer to per day per person. 
+
+- qSusc: probability that symptoms are mistaken for covid (false detection)
+- qIpre: probability that symptoms reflect covid (true detection) 
+- qIinf: probability that symptoms reflect covid (true detection) (0.4)
+- qPost: probability that symptoms are mistaken for covid (false detection)
+
+#### By tests
+
+The following rates relate to one test for one person dependent on state.
+
+- tSusc: probability for a false positive (small)
+- tIpre: probability for true test at preinfectious state (small but sensitive test technology can detect before symptoms arise) 
+- tIinf: probability for a true test at infectious state (bigger)
+- tPost: probability for a false positive
+
+Such rates depend on the technology used [1]. 
+
+### Updating of states
+
+ - shift people in last day of Quar into Post [simplifcition for now]
+ - shift everybody else in Quar by +1 day 
+ - shift people in last day of Iinf to Post
+ - shift everybody else in Iinf by +1 day 
+ - move people in last day of Ipre into first day of Iinf (1-psym1) or Quar (psym) [simplification]
+ - shift everybody else in Ipre by +1 day 
+ 
+### Infection activity
+ 
+ - create newly infected proportional to community prevalence and group numbers of infected
+ - put newly infected into Ipre[1] and remove them from susceptables Susc
+ - during commute using PrevCom
+ - during school time in own Group: infection rate ~ppre*|Ipre|, ~pinf*|Iinf| (later: from other groups in school)
+
+
+
+## R Functions
+
+### Create objects
+
+```{r}
+make.Group <- function(){
+  Group <- list(Day=0, # initialisation is 0, as we update day immediately in scenaries and come out with Dsch as last day
+                Susc=Nst, Ipre=rep(0,Dpre), Iinf=rep(0,Dinf), Post=0, 
+                QSusc=rep(0,Dqua), QIpre=rep(0,Dqua), QIinf=rep(0,Dqua), QPost=rep(0,Dqua))
+  return(Group)
+}
+make.GroupEvo <- function(){
+  GroupEvo <- matrix(0, ncol=8, nrow=Dsch)
+  rownames(GroupEvo) <- 1:Dsch  # as said above, only from t=1 needed
+  colnames(GroupEvo) <- c("Susc", "Ipre", "Iinf", "Post", "QSusc", "QIpre", "QIinf", "QPost")
+  return(GroupEvo)
+}
+```
+
+### Output
+
+```{r}
+# FUNCTION update.summary: summaries of counts of states 
+update.summary <- function(GroupEvo, t, Group){
+  GroupEvo[t,"Susc"] <- Group$Susc
+  GroupEvo[t,"Ipre"] <- sum(Group$Ipre)
+  GroupEvo[t,"Iinf"] <- sum(Group$Iinf)
+  GroupEvo[t,"Post"] <- Group$Post
+  GroupEvo[t,"QSusc"] <- sum(Group$QSusc)
+  GroupEvo[t,"QIpre"] <- sum(Group$QIpre)
+  GroupEvo[t,"QIinf"] <- sum(Group$QIinf)
+  GroupEvo[t,"QPost"] <- sum(Group$QPost)
+  return(GroupEvo)
+} 
+
+# FUNCTION plot.SIIQ
+# Display evolution of states over time with alternative layout options 
+plot.SIIRQ <- function(GroupEvo, alt=0, title){
+  xtick<-seq(1, Dsch, by=7)
+  if (alt==0){colstates=c("royalblue3", "darkorange", "orangered2", "lightsteelblue1", "peachpuff", "mistyrose2", "lightcyan2", "cyan4")}
+  if (alt==1){colstates=c("royalblue3", "lightsteelblue1", "darkorange", "peachpuff", "orangered2", "mistyrose2", "cyan4", "lightcyan2")}
+  if (alt==2){colstates=c("royalblue3", "lightsteelblue1", "darkorange", "peachpuff", "mistyrose2", "orangered2", "lightcyan2", "cyan4")}
+  if (alt==3){colstates=c("royalblue3", "lightsteelblue1", "peachpuff","darkorange",  "orangered2", "mistyrose2", "lightcyan2", "cyan4")}
+  barplot(t(GroupEvo[,c("Susc","QSusc", "QIpre", "Ipre","Iinf", "QIinf", "QPost", "Post")]), 
+            col=colstates, xaxt='n', main=title, border=NA)
+}
+
+# FUNCTION legend.SIIRQ
+legend.SIIRQ <- function(col){
+  leg.txt <- c("susceptible", "preinfectious", "infectious", "recovered", "isolation (susceptible)", "isolation (preinfectious)", "isolation (infectious)", "isolation (recovered)")
+  plot(1:8, pch='.', cex=0.01, xaxt='n', yaxt='n', xlab="", ylab="")
+  legend(x="top",
+       legend=leg.txt, # Vector with the name of each group
+       col = col, # Color of lines or symbols
+       pch=15,              # Add pch symbols to legend lines or boxes
+       bty = "n",        # Box type (bty = "n" removes the box)
+       cex = 2.8,          # Legend size
+       title = NULL     # Legend title
+       )
+}
+```
+
+### Testing
+
+```{r}
+
+# FUNCTION testing.rapid.I:
+# infectious states can go into quarantine based on (true) positive tests
+test.I <- function(Group){
+  for (i in 1:Dpre){ 
+    tmp <- Group$Ipre[i] * tIpre
+    Group$Ipre[i] <- Group$Ipre[i] - tmp
+    Group$QIpre[1] <- Group$QIpre[1] + tmp
+  }
+  for (i in 1:Dinf){
+    tmp <- Group$Iinf[i] * tIinf
+    Group$Iinf[i] <- Group$Iinf[i] - tmp
+    Group$QIinf[1] <- Group$QIinf[1] + tmp
+  }  
+  return(Group)
+}
+
+# FUNCTION testing.rapid.All:
+# all states can go into quarantine based on positive tests (true pos for I states, false pos for Susc, Post)
+test.All <- function(Group){
+  tmp <- Group$Susc * tSusc
+  Group$Susc <- Group$Susc - tmp
+  Group$QSusc[1] <- Group$QSusc[1] + tmp
+  for (i in 1:Dpre){ 
+    tmp <- Group$Ipre[i] * tIpre
+    Group$Ipre[i] <- Group$Ipre[i] - tmp
+    Group$QIpre[1] <- Group$QIpre[1] + tmp
+  }
+  for (i in 1:Dinf){
+    tmp <- Group$Iinf[i] * tIinf
+    Group$Iinf[i] <- Group$Iinf[i] - tmp
+    Group$QIinf[1] <- Group$QIinf[1] + tmp
+  }  
+  return(Group)
+}
+```
+
+
+### Updating state counts according to disease dynamics and isolation policies
+
+```{r}
+# FUNCTION update infection state counts by a day
+update.I.states <- function(Group){
+  Group$Post <- Group$Post + Group$Iinf[Dinf]    # from last day of Iinf to Post
+  Group$Iinf[2:Dinf] <- Group$Iinf[1:(Dinf-1)]   # advance within Iinf
+  Group$Iinf[1] <- Group$Ipre[Dpre]              # from last day of Ipre to Iinf
+  Group$Ipre[2:Dpre] <- Group$Ipre[1:(Dpre-1)]   # move within Ipre
+  Group$Ipre[1] <- 0                             # initialise first day of Ipre
+  return(Group)
+}
+
+# FUNCTION update quarantine state counts by a day for infectious states only
+update.QI.states <- function(Group){ 
+  Group$Post <- Group$Post + Group$QIpre[Dqua]   
+  Group$QIpre[2:Dqua] <- Group$QIpre[1:(Dqua-1)]
+  Group$QIpre[1] <- 0
+  Group$Post <- Group$Post + Group$QIinf[Dqua]
+  Group$QIinf[2:Dqua] <- Group$QIinf[1:(Dqua-1)]
+  Group$QIinf[1] <- 0
+  return(Group)
+}
+
+# FUNCTION update quarantine state counts by a day for all states 
+update.QAll.states <- function(Group){
+  Group <- update.QI.states(Group)
+  # updating QnonI states
+  Group$Susc <- Group$Susc + Group$QSusc[Dqua]
+  Group$QSusc[2:Dqua] <- Group$QSusc[1:(Dqua-1)]
+  Group$QSusc[1] <- 0
+  Group$Post <- Group$Post + Group$QPost[Dqua]
+  Group$QPost[2:Dqua] <- Group$QPost[1:(Dqua-1)]
+  Group$QPost[1] <- 0
+  return(Group)
+}
+
+# FUNCTION symptomatic detection and sending to quarantine - true only
+detect.symp.I <- function(Group){
+  for (i in 1:Dpre){
+    tmp <- Group$Ipre[i] * qIpre
+    Group$Ipre[i] <- Group$Ipre[i] - tmp
+    Group$QIpre[1] <- Group$QIpre[1] + tmp}
+  for (i in 1:Dinf){
+    tmp <- Group$Iinf[i] * qIinf
+    Group$Iinf[i] <- Group$Iinf[i] - tmp
+    Group$QIinf[1] <- Group$QIinf[1] + tmp}
+  return(Group)
+}  
+
+# FUNCTION symptomatic detection and sending to quarantine - true and false
+detect.symp.All <- function(Group){
+  # symptomatic detection (true only) 
+  Group <- detect.symp.I(Group) 
+  # symptomatic detection (false only)
+  tmp <- Group$Susc * qSusc
+  Group$Susc <- Group$Susc - tmp
+  Group$QSusc[1] <- Group$QSusc[1] + tmp
+  tmp <- Group$Post * qPost
+  Group$Post <- Group$Post - tmp
+  Group$QPost[1] <- Group$QPost[1] + tmp
+return(Group)
+}
+
+# FUNCTION rapid test detection and sending to quarantine - true only
+detect.test.I <- function(Group){
+  for (i in 1:Dpre){
+    tmp <- Group$Ipre[i] * tIpre
+    Group$Ipre[i] <- Group$Ipre[i] - tmp
+    Group$QIpre[1] <- Group$QIpre[1] + tmp}
+  for (i in 1:Dinf){
+    tmp <- Group$Iinf[i] * tIinf
+    Group$Iinf[i] <- Group$Iinf[i] - tmp
+    Group$QIinf[1] <- Group$QIinf[1] + tmp}
+  return(Group)
+}  
+
+# FUNCTION rapid test detection and sending to quarantine - true and false
+detect.test.All <- function(Group){
+  # test detection (true only) 
+  Group <- detect.test.I(Group)
+  # test detection (false only)
+  tmp <- Group$Susc * tSusc
+  Group$Susc <- Group$Susc - tmp
+  Group$QSusc[1] <- Group$QSusc[1] + tmp
+  tmp <- Group$Post * tPost
+  Group$Post <- Group$Post - tmp
+  Group$QPost[1] <- Group$QPost[1] + tmp
+  return(Group)
+}
+
+# FUNCTION infection activity
+infection.activity <- function(Group,t){
+  if (t%%7 == 6 | t%%7==0) # infections on free days
+    Inew <- (Group$Susc) * pfree 
+  else { # infections on work days 
+    ptmp <- min(1,(pcom + pwork + pinf * max(sum(Group$Iinf),0)))
+    Inew <- (Group$Susc) * (pcom + pwork + pinf * max(sum(Group$Iinf),0)) 
+#    cat(ptmp)
+  }
+  cat(" || ")
+  Group$Susc <- max(Group$Susc - Inew, 0)
+  Group$Ipre[1] <- Inew
+  return(Group)
+}
+```
+
+
+### Running scheme one day 
+```{r}
+# Check if there may be any incorrect (e.g. negative) numbers for states
+
+# FUNCTION no intervention
+update.day <- function(Group, t){
+  Group$Day <- Group$Day + 1  # initial value for Day in make.group() is 0=Sunday
+  Group <- update.I.states(Group)
+  Group <- infection.activity(Group,t) 
+  return(Group)
+}
+
+# FUNCTION update.Q.symp.I
+# Symptomatic detection of truly infected states
+update.day.Q.symp.I <- function(Group,t){  
+  Group$Day <- Group$Day + 1
+  Group <- update.I.states(Group)
+  Group <- update.QI.states(Group)
+  Group <- detect.symp.I(Group)
+  Group <- infection.activity(Group,t) 
+  return(Group)
+}
+
+# FUNCTION update.Q.symp.All
+# Symptomatic detection for all states (true and false symptoms)
+update.day.Q.symp.All <- function(Group,t){  
+  Group$Day <- Group$Day + 1
+  Group <- update.I.states(Group)
+  Group <- update.QAll.states(Group)
+  Group <- detect.symp.All(Group)
+  Group <- infection.activity(Group,t) 
+  return(Group)
+}
+
+# FUNCTION update.Q.symp.I
+# Symptomatic and test detection of truly infected states
+update.day.Q.symp.test.I <- function(Group,t,testscheme){  
+  Group$Day <- Group$Day + 1
+  Group <- update.I.states(Group)
+  Group <- update.QI.states(Group)
+  Group <- detect.symp.I(Group)
+  if (t %in% testscheme){ 
+    #cat(t)
+    Group <- detect.test.I(Group)
+    #cat(",")
+    }
+  Group <- infection.activity(Group,t) 
+  return(Group)
+}
+
+# FUNCTION update.Q.symp.All
+# Symptomatic and test detection for all states (true and false symptoms)
+update.day.Q.symp.test.All <- function(Group,t,testscheme){  
+  Group$Day <- Group$Day + 1
+  Group <- update.I.states(Group)
+  Group <- update.QAll.states(Group)
+  Group <- detect.symp.All(Group)
+  if (t %in% testscheme){ 
+    #cat(t)
+    Group <- detect.test.All(Group)
+    #cat(",")
+    }
+  Group <- infection.activity(Group,t) 
+  return(Group)
+}
+```
+
+
+### Runnning scenarios 
+
+```{r}
+# FUNCTION scenario
+# with not interventions (no quarantine, no symptom, no testing)
+scenario <- function(Dsch){
+  Group <- make.Group() 
+  GroupEvo <- make.GroupEvo() 
+  for (t in 1:Dsch){ 
+    Group <- update.day(Group, t)
+    GroupEvo <- update.summary(GroupEvo, t, Group)
+  } 
+  return(GroupEvo)
+}  
+
+# FUNCTION scenario.Q.symp.I
+# Symptomatic quarantine: With quarantine only for infected states (only true symptoms)
+scenario.Q.symp.I <- function(Dsch){
+  Group <- make.Group() 
+  GroupEvo <- make.GroupEvo() 
+  for (t in 1:Dsch){
+    Group <- update.day.Q.symp.I(Group, t)
+    GroupEvo <- update.summary(GroupEvo, t, Group)
+  } 
+  return(GroupEvo)
+}
+
+# FUNCTION scenario.Q.symp.All
+# Symptomatic quarantine: With quarantine for all states (true and falsely symptom detected)
+scenario.Q.symp.All <- function(Dsch){
+  Group <- make.Group() 
+  GroupEvo <- make.GroupEvo() 
+  for (t in 1:Dsch){
+    Group <- update.day.Q.symp.All(Group, t)
+    GroupEvo <- update.summary(GroupEvo, t, Group)
+  } 
+  return(GroupEvo)
+}
+```
+
+
+### With testing to go to quarantine
+
+```{r}
+# with true (only) symptom detected and true (only) test detected quarantine
+# test parameters constant over Ipre and over Iinf
+# testscheme: vector with testing days of the week (subset of {1,...,7})
+# daily dynamic: update infection, then update testing - Why this order???
+scenario.Q.symp.test.I <- function(Dsch,testscheme){
+  Group <- make.Group() 
+  GroupEvo <- make.GroupEvo() 
+  for (t in 1:Dsch){
+    Group <- update.day.Q.symp.test.I(Group,t,testscheme)
+    GroupEvo <- update.summary(GroupEvo, t, Group)} 
+  return(GroupEvo)
+}
+
+# with true and false symptom detected and true and false test detected quarantine
+# test parameters constant over Ipre and over Iinf
+# testscheme: vector with testing days of the week (subset of {1,...,7})
+# daily dynamic: update infection, then update testing
+scenario.Q.symp.test.All <- function(Dsch,testscheme){
+  Group <- make.Group() 
+  GroupEvo <- make.GroupEvo() 
+  for (t in 1:Dsch){ 
+    Group <- update.day.Q.symp.test.All(Group,t,testscheme)
+    GroupEvo <- update.summary(GroupEvo, t, Group)} 
+  return(GroupEvo)
+}
+```
+
+
+## Run
+
+```{r}
+run <- function(){
+  par(mfrow=c(5,1), omi=c(0,0,0,0), mar=c(0.2,2.1,2,0))
+  
+  GroupEvo <- scenario(Dsch)
+  plot.SIIRQ(GroupEvo, 3, "Without isolation") 
+
+  GroupEvo <- scenario.Q.symp.I(Dsch)
+  plot.SIIRQ(GroupEvo, 3, "Isolation after symptomatic detection (true pos only)")
+  
+  GroupEvo <- scenario.Q.symp.All(Dsch)
+  plot.SIIRQ(GroupEvo, 3, "Isolation after symptomatic detection (true pos and false pos)")
+  
+  GroupEvo <- scenario.Q.symp.test.I(Dsch,testscheme)
+  plot.SIIRQ(GroupEvo, 3, "Isolation after symptomatic and test detection (true pos only)")
+  
+  GroupEvo <- scenario.Q.symp.test.All(Dsch, testscheme)
+  plot.SIIRQ(GroupEvo, 3, "Isolation after symptomatic and test detection (true pos and false pos)")
+}  
+```
+
+
+## Parameters 
+
+```{r}
+# Sizes1
+Nst <- 30 # regular number student per group
+Dsch <- 7*6 # time length school takes place
+Dpre <- 4 # days infected but not infectious (incubation period)
+Dinf <- 9 # days infectious (symptoms/detectability may start later/earlier)
+Dqua <- 14  # exit with test, not fully accurate set up as such...(won't work for truly infectious)
+
+# Infection rates
+pwork <- 0.001 # infection via community on work days, e.g. friends, clubs
+pfree <- 0.01 # infection via community on free days
+pcom <- 0.001 # infection via commuting (e.g. bus)
+pinf <- 0.1 # infection inside group baseline probablity (per day, per infected infectious person,...)
+
+# Symptomatic detection probabilities per day per person
+qSusc <- 0.01 # false symptoms
+qIpre <- 0.2 # true symptoms
+qIinf <- 0.6 # true symptoms (0.4)
+qPost <- 0.01 # false symptoms
+
+# Test detection probabilities per test per person
+tSusc <- 0.001 # false pos
+tIpre <- 0.3 # true pos
+tIinf <- 0.8 # true pos
+tPost <- 0.01 # false pos
+
+# Testscheme
+#testscheme <- sort(c(seq(1,Dsch,7),seq(2,Dsch,7), seq(3,Dsch,7), seq(4,Dsch,7), seq(5,Dsch,7)))
+testscheme <- sort(c(seq(1,Dsch,7),seq(4,Dsch,7)))
+```
+
+
+```{r}
+run()
+```
+
+
+
+
+## TO DO
+
+PARAMETERS
+Maybe avoid elicity so many absolute parameters, but define baseline and others relative to that
+
+define score Q vs I???
+
+TEACHERS
+*Class teacher/generic to sum up all teachers
+Several teachers modeled separately and going between classes when building a school
+  
+WEAKEND
+**Locally that makes a difference due to different nature of infection activity on weekends, only through family/community not through commute/school (except boarding)
+
+QUARANTINE POLICY
+*Whole class Q: Put all in quarantine if there is at least on infection
+Divide into half group size and conduct alternating f2f lessons (Wechselunterricht)
+
+TESTING
+PCR - same, just different parameters
+Pooled testing - only makes local difference, hence not that relevant!
+
+REINFECTION
+* Recovered only partially immune: add infection dynamic for recov state, just with different parameters 
+*** Immunity wearing off (include memory of when infection was)
+
+INFECTION DYNAMICS
+** Superspreaders
+*** Non-spreaders, degrees in between
+  
+VACCINATION
+Equivalent to partial immunity, so just merge them with recovered
+Recovered is also only partially immune (see above)
+Only part of the population (teachers, children) will be vaccinated
+Immune escape variants
+Mixture of vaccines plus non-vaxed
+
+LONG TERM
+Testing less often
+Goal is now not anymore infection limitation but new variant detection
+
+make function with all parameters
+make app
+improve infection model in class: poisson?
+
+Can similar code be used for university return?
+In particular OS students
+
+
+# Using this for...
+
+# Question we can try to answer with this school simulator
+
+Given constrainst resources, what test scheme is best in terms of minimising absences and infection counts?
+
+Are circuit breakers useful? How long?
+
+Role of length of isolation?
+
+What are good sizes for bubbles?
+
+Given all else equal, what sensitivity is needed to control infection at soandso level?
+
+
+# Resources
+
+https://www.nhs.uk/conditions/coronavirus-covid-19/self-isolation-and-treatment/when-to-self-isolate-and-what-to-do/
+Variable names all called quarantine though it's actually called self isolation when based on disease detection/suspicion in the individuum themselves
+
+Infection states:
+https://www.dovepress.com/covid-19-in-shanghai-ipc-policy-exploration-in-support-of-work-resumpt-peer-reviewed-fulltext-article-RMHP
+
+How long states take 
+https://theconversation.com/how-long-are-you-infectious-when-you-have-coronavirus-135295
+
+[1] Following Drosten podcast 13.4.2021 (watch for updates expected from incoming empirical data over next weeks/months as rapid test programmes are being rolled out).
+Detectability by symptoms: day 0+
+Detectability by PCR: Day -2,-1,0,1,...,7 with high sensitivity and 1 day before/after with lower sensitivity
+Detectability by rapid test: Day 1,2,3,...,7 with high sensitivity and 1 day before/after with lower sensitivity
+Different opinion on https://rapidtests.de : rapid tests detect already before symptoms
+https://publikum.net/schnelltests/
+
+Note that in reality, testing sensitivity depends on
+1. day post infection (above simplified as states)
+2. individual (physiological, subjective testability): Could internally use a family of curves, but users just select a parameter (average over some period), in long term studies there could be learning
+3. sample extraction 
+4. test type and real world implementation competence... see https://www.nature.com/articles/d41586-021-00332-4
+5. Variant: Is it easier to test for delta? (Higher detectability would offer some compensation for the higher transmissibility, so with testing in place it could be cancelled out.) But there may be test escape variants, too, given the virus so far has been playing a smart game against us...
+6. Age: Do they work in children with lower viral loads? 
